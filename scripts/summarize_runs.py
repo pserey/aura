@@ -30,8 +30,11 @@ class PhaseMetrics:
     exit_code: int | None = None
     mem_max_mb: float | None = None
     mem_mean_mb: float | None = None
-    cpu_path: str | None = None
-    mem_path: str | None = None
+    mem_min_mb: float | None = None
+    cpu_max_pct: float | None = None
+    cpu_mean_pct: float | None = None
+    cpu_min_pct: float | None = None
+    samples_count: int | None = None
 
 @dataclass
 class JobRecord:
@@ -55,7 +58,43 @@ def load_events(runs_dir: Path):
                     continue
                 yield f.name, evt
 
-def build_job_index(events):
+def load_metrics_csv(csv_path: Path) -> dict:
+    """Lê CSV de métricas e retorna estatísticas calculadas."""
+    if not csv_path.exists():
+        return {}
+    
+    cpu_values = []
+    mem_values = []
+    
+    try:
+        with csv_path.open("r", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                try:
+                    cpu = float(row["cpu_percent"])
+                    mem = float(row["memory_mb"])
+                    cpu_values.append(cpu)
+                    mem_values.append(mem)
+                except (ValueError, KeyError):
+                    continue
+    except Exception as e:
+        print(f"[WARN] Erro ao ler {csv_path.name}: {e}", file=sys.stderr)
+        return {}
+    
+    if not cpu_values or not mem_values:
+        return {}
+    
+    return {
+        "cpu_max": max(cpu_values),
+        "cpu_mean": mean(cpu_values),
+        "cpu_min": min(cpu_values),
+        "mem_max": max(mem_values),
+        "mem_mean": mean(mem_values),
+        "mem_min": min(mem_values),
+        "samples": len(cpu_values),
+    }
+
+def build_job_index(events, runs_dir: Path):
     jobs: dict[str, JobRecord] = {}
     all_started_ts = []
     all_finished_ts = []
@@ -95,11 +134,39 @@ def build_job_index(events):
             pm.duration_sec = meta.get("duration_sec")
             pm.success = bool(meta.get("success", meta.get("ok")))
             pm.exit_code = meta.get("exit_code")
-            metrics = meta.get("metrics") or {}
-            pm.mem_max_mb = metrics.get("max")
-            pm.mem_mean_mb = metrics.get("mean")
-            pm.cpu_path = metrics.get("cpu")
-            pm.mem_path = metrics.get("memory")
+            
+            # Tentar ler métricas de streaming_metrics (novo formato no JSON)
+            streaming = meta.get("streaming_metrics", {})
+            if streaming:
+                cpu_metrics = streaming.get("cpu", {})
+                mem_metrics = streaming.get("memory", {})
+                collection = streaming.get("collection", {})
+                
+                pm.cpu_max_pct = cpu_metrics.get("max")
+                pm.cpu_mean_pct = cpu_metrics.get("mean")
+                pm.cpu_min_pct = cpu_metrics.get("min")
+                pm.mem_max_mb = mem_metrics.get("max")
+                pm.mem_mean_mb = mem_metrics.get("mean")
+                pm.mem_min_mb = mem_metrics.get("min")
+                pm.samples_count = collection.get("samples_count")
+            else:
+                # Fallback para formato antigo (metrics simples)
+                metrics = meta.get("metrics") or {}
+                pm.mem_max_mb = metrics.get("max")
+                pm.mem_mean_mb = metrics.get("mean")
+
+            # Tentar carregar métricas dos CSVs (nova estrutura de arquivos)
+            csv_path = runs_dir / f"{job_id}_{phase}_metrics.csv"
+            csv_metrics = load_metrics_csv(csv_path)
+            if csv_metrics:
+                # CSV tem precedência sobre JSON quando disponível
+                pm.cpu_max_pct = csv_metrics.get("cpu_max")
+                pm.cpu_mean_pct = csv_metrics.get("cpu_mean")
+                pm.cpu_min_pct = csv_metrics.get("cpu_min")
+                pm.mem_max_mb = csv_metrics.get("mem_max")
+                pm.mem_mean_mb = csv_metrics.get("mem_mean")
+                pm.mem_min_mb = csv_metrics.get("mem_min")
+                pm.samples_count = csv_metrics.get("samples")
 
             # cleanup (só deve existir em solve ok)
             mc = meta.get("model_cleanup") or {}
@@ -153,11 +220,16 @@ def summarize(jobs: dict[str, JobRecord], all_started_ts, all_finished_ts):
     if makespan_sec and makespan_sec > 0:
         throughput = solved_ok / (makespan_sec / 3600.0)
 
-    # Memória global
+    # Memória e CPU globais
     mem_max_global = None
     mem_max_candidates = []
     mem_mean_weighted = None
-    mean_pairs = []  # (phase_mean, phase_duration)
+    mem_mean_pairs = []  # (phase_mean, phase_duration)
+    
+    cpu_max_global = None
+    cpu_max_candidates = []
+    cpu_mean_weighted = None
+    cpu_mean_pairs = []  # (phase_mean, phase_duration)
 
     for jr in jobs.values():
         for ph in ("build", "solve"):
@@ -167,11 +239,19 @@ def summarize(jobs: dict[str, JobRecord], all_started_ts, all_finished_ts):
             if pm.mem_max_mb is not None:
                 mem_max_candidates.append(pm.mem_max_mb)
             if pm.mem_mean_mb is not None and pm.duration_sec:
-                mean_pairs.append((pm.mem_mean_mb, pm.duration_sec))
+                mem_mean_pairs.append((pm.mem_mean_mb, pm.duration_sec))
+            if pm.cpu_max_pct is not None:
+                cpu_max_candidates.append(pm.cpu_max_pct)
+            if pm.cpu_mean_pct is not None and pm.duration_sec:
+                cpu_mean_pairs.append((pm.cpu_mean_pct, pm.duration_sec))
 
     if mem_max_candidates:
         mem_max_global = max(mem_max_candidates)
-    mem_mean_weighted = weighted_mean(mean_pairs)
+    mem_mean_weighted = weighted_mean(mem_mean_pairs)
+    
+    if cpu_max_candidates:
+        cpu_max_global = max(cpu_max_candidates)
+    cpu_mean_weighted = weighted_mean(cpu_mean_pairs)
 
     # Espera solve após build (proxy)
     waits = []
@@ -209,6 +289,8 @@ def summarize(jobs: dict[str, JobRecord], all_started_ts, all_finished_ts):
         "t1": t1,
         "makespan_sec": makespan_sec,
         "throughput_jobs_per_hour": throughput,
+        "cpu_max_pct": cpu_max_global,
+        "cpu_mean_pct_weighted": cpu_mean_weighted,
         "mem_max_mb": mem_max_global,
         "mem_mean_mb_weighted": mem_mean_weighted,
         "wait_solve_after_build_avg_sec": wait_avg,
@@ -256,6 +338,8 @@ def print_summary(summary: dict, total_cleanup_mb: float, families: list[dict]):
     else:
         print("Throughput         : -")
 
+    print(f"\nCPU (max)          : {summary['cpu_max_pct']:.2f}%" if summary['cpu_max_pct'] is not None else "\nCPU (max)          : -")
+    print(f"CPU (mean, wgt)    : {summary['cpu_mean_pct_weighted']:.2f}%" if summary['cpu_mean_pct_weighted'] is not None else "CPU (mean, wgt)    : -")
     print(f"Memory (max)       : {summary['mem_max_mb']:.2f} MiB" if summary['mem_max_mb'] is not None else "Memory (max)       : -")
     print(f"Memory (mean, wgt) : {summary['mem_mean_mb_weighted']:.2f} MiB" if summary['mem_mean_mb_weighted'] is not None else "Memory (mean, wgt) : -")
 
@@ -273,14 +357,6 @@ def print_summary(summary: dict, total_cleanup_mb: float, families: list[dict]):
     print(f"  Jobs failed (any phase)   : {summary['jobs_failed']}")
     print(f"  Model cleanup freed (MB)  : {total_cleanup_mb:.2f}")
 
-    if families:
-        print("\nPer-family snapshot:")
-        print("  family, jobs, solved_ok, avg_job_total_duration_sec")
-        for f in families:
-            avg = f['avg_job_total_duration_sec']
-            avg_fmt = f"{avg:.3f}" if avg is not None else "-"
-            print(f"  {f['family']}, {f['jobs']}, {f['solved_ok']}, {avg_fmt}")
-
 def maybe_write_csv(out_csv: Path | None, jobs: dict[str, JobRecord]):
     if not out_csv:
         return
@@ -289,8 +365,12 @@ def maybe_write_csv(out_csv: Path | None, jobs: dict[str, JobRecord]):
         w = csv.writer(fh)
         w.writerow([
             "job_id","family",
-            "build_started","build_finished","build_duration_sec","build_success","build_exit_code","build_mem_max_mb","build_mem_mean_mb",
-            "solve_started","solve_finished","solve_duration_sec","solve_success","solve_exit_code","solve_mem_max_mb","solve_mem_mean_mb",
+            "build_started","build_finished","build_duration_sec","build_success","build_exit_code",
+            "build_cpu_max_pct","build_cpu_mean_pct","build_cpu_min_pct",
+            "build_mem_max_mb","build_mem_mean_mb","build_mem_min_mb","build_samples",
+            "solve_started","solve_finished","solve_duration_sec","solve_success","solve_exit_code",
+            "solve_cpu_max_pct","solve_cpu_mean_pct","solve_cpu_min_pct",
+            "solve_mem_max_mb","solve_mem_mean_mb","solve_mem_min_mb","solve_samples",
             "solve_wait_after_build_sec","model_cleanup_mb"
         ])
         for jr in jobs.values():
@@ -308,15 +388,25 @@ def maybe_write_csv(out_csv: Path | None, jobs: dict[str, JobRecord]):
                 f"{b.duration_sec:.6f}" if b.duration_sec is not None else "",
                 "" if b.success is None else int(bool(b.success)),
                 "" if b.exit_code is None else b.exit_code,
-                "" if b.mem_max_mb is None else f"{b.mem_max_mb:.6f}",
-                "" if b.mem_mean_mb is None else f"{b.mem_mean_mb:.6f}",
+                "" if b.cpu_max_pct is None else f"{b.cpu_max_pct:.2f}",
+                "" if b.cpu_mean_pct is None else f"{b.cpu_mean_pct:.2f}",
+                "" if b.cpu_min_pct is None else f"{b.cpu_min_pct:.2f}",
+                "" if b.mem_max_mb is None else f"{b.mem_max_mb:.2f}",
+                "" if b.mem_mean_mb is None else f"{b.mem_mean_mb:.2f}",
+                "" if b.mem_min_mb is None else f"{b.mem_min_mb:.2f}",
+                "" if b.samples_count is None else b.samples_count,
                 s.started.isoformat() if s.started else "",
                 s.finished.isoformat() if s.finished else "",
                 f"{s.duration_sec:.6f}" if s.duration_sec is not None else "",
                 "" if s.success is None else int(bool(s.success)),
                 "" if s.exit_code is None else s.exit_code,
-                "" if s.mem_max_mb is None else f"{s.mem_max_mb:.6f}",
-                "" if s.mem_mean_mb is None else f"{s.mem_mean_mb:.6f}",
+                "" if s.cpu_max_pct is None else f"{s.cpu_max_pct:.2f}",
+                "" if s.cpu_mean_pct is None else f"{s.cpu_mean_pct:.2f}",
+                "" if s.cpu_min_pct is None else f"{s.cpu_min_pct:.2f}",
+                "" if s.mem_max_mb is None else f"{s.mem_max_mb:.2f}",
+                "" if s.mem_mean_mb is None else f"{s.mem_mean_mb:.2f}",
+                "" if s.mem_min_mb is None else f"{s.mem_min_mb:.2f}",
+                "" if s.samples_count is None else s.samples_count,
                 "" if wait is None else f"{wait:.6f}",
                 f"{jr.model_cleanup_mb:.6f}",
             ])
@@ -337,7 +427,7 @@ def main():
         print(f"[WARN] No events found in {runs_dir}", file=sys.stderr)
         sys.exit(0)
 
-    jobs, all_started_ts, all_finished_ts, total_cleanup_mb = build_job_index(events)
+    jobs, all_started_ts, all_finished_ts, total_cleanup_mb = build_job_index(events, runs_dir)
     summary = summarize(jobs, all_started_ts, all_finished_ts)
     families = group_by_family(jobs)
 
