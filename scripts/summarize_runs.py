@@ -220,7 +220,46 @@ def summarize(jobs: dict[str, JobRecord], all_started_ts, all_finished_ts):
     if makespan_sec and makespan_sec > 0:
         throughput = solved_ok / (makespan_sec / 3600.0)
 
-    # Memória e CPU globais
+    # Métricas por fase
+    phase_stats = {}
+    for phase_name in ("build", "solve"):
+        mem_max_candidates = []
+        mem_mean_pairs = []
+        cpu_max_candidates = []
+        cpu_mean_pairs = []
+        duration_values = []
+        
+        for jr in jobs.values():
+            pm: PhaseMetrics = jr.phases.get(phase_name)
+            if not pm or not pm.finished:
+                continue
+            if pm.mem_max_mb is not None:
+                mem_max_candidates.append(pm.mem_max_mb)
+            if pm.mem_mean_mb is not None and pm.duration_sec:
+                mem_mean_pairs.append((pm.mem_mean_mb, pm.duration_sec))
+            if pm.cpu_max_pct is not None:
+                cpu_max_candidates.append(pm.cpu_max_pct)
+            if pm.cpu_mean_pct is not None and pm.duration_sec:
+                cpu_mean_pairs.append((pm.cpu_mean_pct, pm.duration_sec))
+            if pm.duration_sec is not None:
+                duration_values.append(pm.duration_sec)
+        
+        duration_sum = sum(duration_values) if duration_values else None
+        avg_parallelism = None
+        if duration_sum and makespan_sec and makespan_sec > 0:
+            avg_parallelism = duration_sum / makespan_sec
+        
+        phase_stats[phase_name] = {
+            "mem_max_mb": max(mem_max_candidates) if mem_max_candidates else None,
+            "mem_mean_mb_weighted": weighted_mean(mem_mean_pairs),
+            "cpu_max_pct": max(cpu_max_candidates) if cpu_max_candidates else None,
+            "cpu_mean_pct_weighted": weighted_mean(cpu_mean_pairs),
+            "duration_mean_sec": mean(duration_values) if duration_values else None,
+            "duration_sum_sec": duration_sum,
+            "avg_parallelism": avg_parallelism,
+        }
+
+    # Memória e CPU globais (todas as fases)
     mem_max_global = None
     mem_max_candidates = []
     mem_mean_weighted = None
@@ -293,6 +332,7 @@ def summarize(jobs: dict[str, JobRecord], all_started_ts, all_finished_ts):
         "cpu_mean_pct_weighted": cpu_mean_weighted,
         "mem_max_mb": mem_max_global,
         "mem_mean_mb_weighted": mem_mean_weighted,
+        "phase_stats": phase_stats,
         "wait_solve_after_build_avg_sec": wait_avg,
         "wait_solve_after_build_p50_sec": wait_p50,
         "wait_solve_after_build_p95_sec": wait_p95,
@@ -311,16 +351,48 @@ def group_by_family(jobs: dict[str, JobRecord]):
         # métricas simples por família
         solved_ok = sum(1 for jr in jlist
                         if jr.phases.get("solve") and jr.phases["solve"].finished and jr.phases["solve"].success)
-        durations = [ (jr.phases["build"].duration_sec or 0) + (jr.phases["solve"].duration_sec or 0)
-                      for jr in jlist
-                      if (jr.phases.get("build") and jr.phases.get("solve")
-                          and jr.phases["solve"].finished)]
+        
+        durations = []
+        mem_max_values = []
+        mem_mean_pairs = []
+        cpu_max_values = []
+        cpu_mean_pairs = []
+        
+        for jr in jlist:
+            build = jr.phases.get("build")
+            solve = jr.phases.get("solve")
+            
+            # Durações
+            if build and solve and solve.finished:
+                total_dur = (build.duration_sec or 0) + (solve.duration_sec or 0)
+                durations.append(total_dur)
+            
+            # Métricas de memória e CPU
+            for phase in (build, solve):
+                if not phase or not phase.finished:
+                    continue
+                if phase.mem_max_mb is not None:
+                    mem_max_values.append(phase.mem_max_mb)
+                if phase.mem_mean_mb is not None and phase.duration_sec:
+                    mem_mean_pairs.append((phase.mem_mean_mb, phase.duration_sec))
+                if phase.cpu_max_pct is not None:
+                    cpu_max_values.append(phase.cpu_max_pct)
+                if phase.cpu_mean_pct is not None and phase.duration_sec:
+                    cpu_mean_pairs.append((phase.cpu_mean_pct, phase.duration_sec))
+        
         avg_total = mean(durations) if durations else None
+        duration_sum = sum(durations) if durations else 0
+        
         out.append({
             "family": family,
             "jobs": len(jlist),
             "solved_ok": solved_ok,
-            "avg_job_total_duration_sec": avg_total
+            "avg_job_total_duration_sec": avg_total,
+            "duration_sum_sec": duration_sum,
+            "mem_max_mb": max(mem_max_values) if mem_max_values else None,
+            "mem_mean_mb_weighted": weighted_mean(mem_mean_pairs),
+            "cpu_max_pct": max(cpu_max_values) if cpu_max_values else None,
+            "cpu_mean_pct_weighted": weighted_mean(cpu_mean_pairs),
         })
     out.sort(key=lambda d: d["family"])
     return out
@@ -328,6 +400,11 @@ def group_by_family(jobs: dict[str, JobRecord]):
 def print_summary(summary: dict, total_cleanup_mb: float, families: list[dict]):
     def fmt_ts(dt: datetime | None):
         return dt.isoformat() if dt else "-"
+    
+    def fmt_metric(value, unit="", decimals=2):
+        if value is None:
+            return "-"
+        return f"{value:.{decimals}f}{unit}"
 
     print("\n=== Aura Orchestrator — Experimental Summary ===")
     print(f"Window start (t0): {fmt_ts(summary['t0'])}")
@@ -338,24 +415,64 @@ def print_summary(summary: dict, total_cleanup_mb: float, families: list[dict]):
     else:
         print("Throughput         : -")
 
-    print(f"\nCPU (max)          : {summary['cpu_max_pct']:.2f}%" if summary['cpu_max_pct'] is not None else "\nCPU (max)          : -")
-    print(f"CPU (mean, wgt)    : {summary['cpu_mean_pct_weighted']:.2f}%" if summary['cpu_mean_pct_weighted'] is not None else "CPU (mean, wgt)    : -")
-    print(f"Memory (max)       : {summary['mem_max_mb']:.2f} MiB" if summary['mem_max_mb'] is not None else "Memory (max)       : -")
-    print(f"Memory (mean, wgt) : {summary['mem_mean_mb_weighted']:.2f} MiB" if summary['mem_mean_mb_weighted'] is not None else "Memory (mean, wgt) : -")
+    print("\n--- Overall Resources ---")
+    print(f"CPU (max)          : {fmt_metric(summary['cpu_max_pct'], '%')}")
+    print(f"CPU (mean, wgt)    : {fmt_metric(summary['cpu_mean_pct_weighted'], '%')}")
+    print(f"Memory (max)       : {fmt_metric(summary['mem_max_mb'], ' MiB')}")
+    print(f"Memory (mean, wgt) : {fmt_metric(summary['mem_mean_mb_weighted'], ' MiB')}")
+
+    # Estatísticas por fase
+    phase_stats = summary.get('phase_stats', {})
+    for phase_name in ("build", "solve"):
+        stats = phase_stats.get(phase_name, {})
+        if not stats:
+            continue
+        print(f"\n--- {phase_name.capitalize()} Phase ---")
+        print(f"Duration (per job avg)   : {format_duration(stats.get('duration_mean_sec'))}")
+        print(f"Duration (sum all jobs)  : {format_duration(stats.get('duration_sum_sec'))}")
+        if stats.get('avg_parallelism') is not None:
+            print(f"Avg parallelism          : {stats['avg_parallelism']:.2f}x")
+        print(f"CPU (max)                : {fmt_metric(stats.get('cpu_max_pct'), '%')}")
+        print(f"CPU (mean, wgt)          : {fmt_metric(stats.get('cpu_mean_pct_weighted'), '%')}")
+        print(f"Memory (max)             : {fmt_metric(stats.get('mem_max_mb'), ' MiB')}")
+        print(f"Memory (mean, wgt)       : {fmt_metric(stats.get('mem_mean_mb_weighted'), ' MiB')}")
 
     if summary['wait_solve_after_build_avg_sec'] is not None:
-        print(f"Solve wait after Build (avg): {format_duration(summary['wait_solve_after_build_avg_sec'])}")
-        print(f"Solve wait after Build (p50): {format_duration(summary['wait_solve_after_build_p50_sec'])}")
-        print(f"Solve wait after Build (p95): {format_duration(summary['wait_solve_after_build_p95_sec'])}")
-    else:
-        print("Solve wait after Build      : -")
+        print(f"\n--- Solve Wait After Build ---")
+        print(f"Average: {format_duration(summary['wait_solve_after_build_avg_sec'])}")
+        print(f"P50    : {format_duration(summary['wait_solve_after_build_p50_sec'])}")
+        print(f"P95    : {format_duration(summary['wait_solve_after_build_p95_sec'])}")
 
-    print("\nCounts:")
-    print(f"  Jobs (total)              : {summary['total_jobs']}")
-    print(f"  Jobs with Build finished  : {summary['jobs_with_build_finished']}")
-    print(f"  Jobs with Solve finished  : {summary['jobs_with_solve_finished']}")
-    print(f"  Jobs failed (any phase)   : {summary['jobs_failed']}")
-    print(f"  Model cleanup freed (MB)  : {total_cleanup_mb:.2f}")
+    print("\n--- Counts ---")
+    print(f"Jobs (total)              : {summary['total_jobs']}")
+    print(f"Jobs with Build finished  : {summary['jobs_with_build_finished']}")
+    print(f"Jobs with Solve finished  : {summary['jobs_with_solve_finished']}")
+    print(f"Jobs failed (any phase)   : {summary['jobs_failed']}")
+    print(f"Families (total)          : {len(families)}")
+    print(f"Model cleanup freed (MB)  : {total_cleanup_mb:.2f}")
+    
+    # Top 3 famílias por diferentes critérios
+    if families:
+        print("\n--- Top 3 Families by Sum of Job Durations ---")
+        top_duration = sorted(families, key=lambda f: f['duration_sum_sec'], reverse=True)[:3]
+        for i, f in enumerate(top_duration, 1):
+            print(f"{i}. {f['family']:30s} | {format_duration(f['duration_sum_sec'])} sum | {f['jobs']} jobs")
+        
+        print("\n--- Top 3 Families by Memory Consumption ---")
+        top_mem = sorted([f for f in families if f['mem_max_mb'] is not None], 
+                         key=lambda f: f['mem_max_mb'], reverse=True)[:3]
+        for i, f in enumerate(top_mem, 1):
+            mem_max = fmt_metric(f['mem_max_mb'], ' MiB')
+            mem_mean = fmt_metric(f['mem_mean_mb_weighted'], ' MiB')
+            print(f"{i}. {f['family']:30s} | max: {mem_max}, mean: {mem_mean} | {f['jobs']} jobs")
+        
+        print("\n--- Top 3 Families by CPU Usage ---")
+        top_cpu = sorted([f for f in families if f['cpu_max_pct'] is not None], 
+                         key=lambda f: f['cpu_max_pct'], reverse=True)[:3]
+        for i, f in enumerate(top_cpu, 1):
+            cpu_max = fmt_metric(f['cpu_max_pct'], '%')
+            cpu_mean = fmt_metric(f['cpu_mean_pct_weighted'], '%')
+            print(f"{i}. {f['family']:30s} | max: {cpu_max}, mean: {cpu_mean} | {f['jobs']} jobs")
 
 def maybe_write_csv(out_csv: Path | None, jobs: dict[str, JobRecord]):
     if not out_csv:
